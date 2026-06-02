@@ -1,23 +1,24 @@
 # Build WebRtcApm — GitHub Actions workflow for the FnVoice WebRTC APM native plugin.
 #
-# Host this in a SEPARATE repo (like your Opus-CSharp one) with this layout:
+# Host in a SEPARATE repo (like Opus-CSharp). Layout:
 #
 #   <repo-root>/
 #     .github/workflows/webrtcapm-build.yml   <- this file
-#     Native/apm_c_api.h                       <- copied from FnVoice/Plugins/WebRtcApm/Native~/
+#     Native/apm_c_api.h                       <- copy these 4 from FnVoice/Plugins/WebRtcApm/Native~/
 #     Native/apm_c_api.cpp
-#     Native/CMakeLists.txt
+#     Native/meson.build
+#     Native/meson_options.txt
 #
-# Each job builds webrtc-audio-processing from source (pinned, STATIC) with meson, then CMake-builds the
-# apm_c_api shim against it and static-links -> ONE self-contained Unity plugin per platform. The final
-# `package` job arranges them into the Unity Plugins/WebRtcApm/ folder layout, ready to drop in.
+# Each job builds webrtc-audio-processing from source (pinned, STATIC) with meson, then builds the
+# apm_c_api shim ALSO with meson against it. meson resolves the static dep graph (abseil/pffft/system
+# libs) natively on every toolchain — that is the robust path CMake's pkg-config-static handling lacked.
 #
-# Outputs (names match [DllImport("WebRtcApm")] + Unity conventions):
-#   Windows x64      -> Plugins/WebRtcApm/x86_64/WebRtcApm.dll
-#   Linux   x64      -> Plugins/WebRtcApm/linux/libWebRtcApm.so
-#   macOS   universal-> Plugins/WebRtcApm/macOS/libWebRtcApm.dylib
-#
-# Android / iOS are deferred to FnVoice Phase 6.3 (meson cross-files + NDK/Xcode toolchains).
+# Outputs (names match [DllImport("WebRtcApm")] + Unity conventions), arranged by the `package` job:
+#   Plugins/WebRtcApm/x86_64/WebRtcApm.dll          Windows x64
+#   Plugins/WebRtcApm/linux/libWebRtcApm.so         Linux x64
+#   Plugins/WebRtcApm/macOS/libWebRtcApm.dylib      macOS universal (arm64 + x86_64)
+#   Plugins/WebRtcApm/Android/<abi>/libWebRtcApm.so arm64-v8a, armeabi-v7a, x86_64
+#   Plugins/WebRtcApm/iOS/libWebRtcApm.a            iOS device (arm64), self-contained merged archive
 
 name: Build WebRtcApm
 
@@ -33,20 +34,22 @@ on:
         required: true
         default: 'all'
         type: choice
-        options: [ all, linux, windows, macos ]
+        options: [ all, linux, windows, macos, android, ios ]
       wap_ref:
         description: 'webrtc-audio-processing git tag/branch'
         required: false
         default: 'v1.3'
 
 env:
-  # Pinned webrtc-audio-processing version (the PulseAudio fork). v1.x/v2.x expose the Config/ApplyConfig
-  # API the shim targets. Override per-run via the workflow_dispatch input.
   WAP_REF: ${{ github.event.inputs.wap_ref || 'v1.3' }}
   WAP_URL: https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing.git
+  ANDROID_API: '24'
+  NDK_VERSION: '28.2.13676358'
+  IOS_MIN: '13.0'
 
 jobs:
 
+  # ----------------------------------------------------------------------------------------------
   build-linux:
     name: Native - Linux (x64)
     runs-on: ubuntu-latest
@@ -57,14 +60,13 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential pkg-config python3-pip
+          sudo apt-get install -y build-essential pkg-config python3-pip
           pip3 install --upgrade meson ninja
 
       - name: Build webrtc-audio-processing (static)
         run: |
           git clone --depth 1 --branch "$WAP_REF" "$WAP_URL" wap-src
-          meson setup wap-build wap-src \
-            --prefix="$GITHUB_WORKSPACE/wap-install" \
+          meson setup wap-build wap-src --prefix="$GITHUB_WORKSPACE/wap-install" \
             --buildtype=release -Ddefault_library=static
           meson compile -C wap-build
           meson install -C wap-build
@@ -72,17 +74,14 @@ jobs:
       - name: Build WebRtcApm shim
         run: |
           export PKG_CONFIG_PATH="$GITHUB_WORKSPACE/wap-install/lib/pkgconfig:$GITHUB_WORKSPACE/wap-install/lib/x86_64-linux-gnu/pkgconfig:$GITHUB_WORKSPACE/wap-install/lib64/pkgconfig"
-          cmake -S Native -B build -DCMAKE_BUILD_TYPE=Release -DWEBRTC_APM_STATIC=ON
-          cmake --build build --config Release
+          meson setup shim-build Native --buildtype=release -Dlibkind=shared
+          meson compile -C shim-build
 
       - name: Verify + stage
         run: |
-          echo "=== Linux outputs ==="
-          find build -name 'libWebRtcApm.so' | sort
-          REAL=$(find build -name 'libWebRtcApm.so' ! -type l | head -n 1)
-          test -n "$REAL"
+          find shim-build -name 'libWebRtcApm.so'
           mkdir -p stage/linux
-          cp "$REAL" stage/linux/libWebRtcApm.so
+          cp shim-build/libWebRtcApm.so stage/linux/libWebRtcApm.so
           ls -lh stage/linux
 
       - uses: actions/upload-artifact@v4
@@ -91,10 +90,13 @@ jobs:
           path: stage/linux/libWebRtcApm.so
           if-no-files-found: error
 
+  # ----------------------------------------------------------------------------------------------
   build-windows:
     name: Native - Windows (x64)
     runs-on: windows-latest
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows' }}
+    env:
+      CCACHE_DISABLE: '1'   # neutralize the Strawberry-Perl ccache that meson auto-detects on the runner
     steps:
       - uses: actions/checkout@v4
 
@@ -111,27 +113,30 @@ jobs:
 
       - name: Build webrtc-audio-processing (static)
         shell: pwsh
+        env:
+          CC: cl
+          CXX: cl
         run: |
           git clone --depth 1 --branch "$env:WAP_REF" "$env:WAP_URL" wap-src
-          meson setup wap-build wap-src `
-            --prefix="$env:GITHUB_WORKSPACE/wap-install" `
+          meson setup wap-build wap-src --prefix="$env:GITHUB_WORKSPACE/wap-install" `
             --buildtype=release -Ddefault_library=static
           meson compile -C wap-build
           meson install -C wap-build
 
       - name: Build WebRtcApm shim
         shell: pwsh
+        env:
+          CC: cl
+          CXX: cl
         run: |
           $env:PKG_CONFIG_PATH = "$env:GITHUB_WORKSPACE/wap-install/lib/pkgconfig"
-          cmake -S Native -B build -G "Visual Studio 17 2022" -A x64 -DWEBRTC_APM_STATIC=ON
-          cmake --build build --config Release
+          meson setup shim-build Native --buildtype=release -Dlibkind=shared
+          meson compile -C shim-build
 
       - name: Verify + stage
         shell: pwsh
         run: |
-          Write-Host "=== Windows outputs ==="
-          Get-ChildItem -Recurse build -Filter WebRtcApm.dll | ForEach-Object { $_.FullName }
-          $dll = Get-ChildItem -Recurse build -Filter WebRtcApm.dll | Select-Object -First 1
+          $dll = Get-ChildItem -Recurse shim-build -Filter WebRtcApm.dll | Select-Object -First 1
           if (-not $dll) { throw "WebRtcApm.dll not produced." }
           New-Item -ItemType Directory -Force stage/win | Out-Null
           Copy-Item $dll.FullName stage/win/WebRtcApm.dll
@@ -142,10 +147,15 @@ jobs:
           path: stage/win/WebRtcApm.dll
           if-no-files-found: error
 
+  # ----------------------------------------------------------------------------------------------
   build-macos:
     name: Native - macOS (universal)
     runs-on: macos-latest
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos' }}
+    env:
+      CFLAGS: "-arch arm64 -arch x86_64"
+      CXXFLAGS: "-arch arm64 -arch x86_64"
+      LDFLAGS: "-arch arm64 -arch x86_64"
     steps:
       - uses: actions/checkout@v4
 
@@ -153,14 +163,9 @@ jobs:
         run: brew install meson ninja pkg-config
 
       - name: Build webrtc-audio-processing (static, universal)
-        env:
-          CFLAGS: "-arch arm64 -arch x86_64"
-          CXXFLAGS: "-arch arm64 -arch x86_64"
-          LDFLAGS: "-arch arm64 -arch x86_64"
         run: |
           git clone --depth 1 --branch "$WAP_REF" "$WAP_URL" wap-src
-          meson setup wap-build wap-src \
-            --prefix="$GITHUB_WORKSPACE/wap-install" \
+          meson setup wap-build wap-src --prefix="$GITHUB_WORKSPACE/wap-install" \
             --buildtype=release -Ddefault_library=static
           meson compile -C wap-build
           meson install -C wap-build
@@ -168,18 +173,13 @@ jobs:
       - name: Build WebRtcApm shim (universal)
         run: |
           export PKG_CONFIG_PATH="$GITHUB_WORKSPACE/wap-install/lib/pkgconfig"
-          cmake -S Native -B build -DCMAKE_BUILD_TYPE=Release \
-            -DWEBRTC_APM_STATIC=ON \
-            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
-          cmake --build build --config Release
+          meson setup shim-build Native --buildtype=release -Dlibkind=shared
+          meson compile -C shim-build
 
       - name: Verify + stage
         run: |
-          echo "=== macOS outputs ==="
-          REAL=$(find build -name 'libWebRtcApm.dylib' ! -type l | head -n 1)
-          test -n "$REAL"
           mkdir -p stage/macos
-          cp "$REAL" stage/macos/libWebRtcApm.dylib
+          cp shim-build/libWebRtcApm.dylib stage/macos/libWebRtcApm.dylib
           lipo -info stage/macos/libWebRtcApm.dylib || true
 
       - uses: actions/upload-artifact@v4
@@ -188,11 +188,143 @@ jobs:
           path: stage/macos/libWebRtcApm.dylib
           if-no-files-found: error
 
+  # ----------------------------------------------------------------------------------------------
+  build-android:
+    name: Native - Android (arm64-v8a, armeabi-v7a, x86_64)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'android' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config python3-pip
+          pip3 install --upgrade meson ninja
+
+      - name: Set up Android NDK
+        uses: android-actions/setup-android@v3
+      - name: Install NDK
+        run: |
+          sdkmanager "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build per ABI
+        run: |
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          git clone --depth 1 --branch "$WAP_REF" "$WAP_URL" wap-src
+          mkdir -p android-out
+
+          build_abi () {
+            ABI="$1"; TRIPLE="$2"; CLANG="$3"; FAMILY="$4"; CPU="$5"
+            echo "=== Building $ABI ==="
+            PREFIX="$GITHUB_WORKSPACE/wap-install-$ABI"
+            cat > cross-$ABI.txt <<EOF
+          [binaries]
+          c = '$NDK_BIN/$CLANG'
+          cpp = '$NDK_BIN/${CLANG}++'
+          ar = '$NDK_BIN/llvm-ar'
+          strip = '$NDK_BIN/llvm-strip'
+          [built-in options]
+          pkg_config_path = '$PREFIX/lib/pkgconfig'
+          [host_machine]
+          system = 'android'
+          cpu_family = '$FAMILY'
+          cpu = '$CPU'
+          endian = 'little'
+          EOF
+            meson setup wap-build-$ABI wap-src --cross-file cross-$ABI.txt \
+              --prefix="$PREFIX" --buildtype=release -Ddefault_library=static
+            meson compile -C wap-build-$ABI
+            meson install -C wap-build-$ABI
+            meson setup shim-$ABI Native --cross-file cross-$ABI.txt \
+              --buildtype=release -Dlibkind=shared
+            meson compile -C shim-$ABI
+            mkdir -p android-out/$ABI
+            cp shim-$ABI/libWebRtcApm.so android-out/$ABI/libWebRtcApm.so
+          }
+
+          build_abi arm64-v8a   aarch64-linux-android      aarch64-linux-android${ANDROID_API}-clang   aarch64 aarch64
+          build_abi armeabi-v7a armv7a-linux-androideabi   armv7a-linux-androideabi${ANDROID_API}-clang arm     armv7
+          build_abi x86_64      x86_64-linux-android        x86_64-linux-android${ANDROID_API}-clang     x86_64  x86_64
+
+          echo "=== Android outputs ==="
+          find android-out -name '*.so' | xargs ls -lh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webrtcapm-android
+          path: android-out/
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------------------------------------
+  build-ios:
+    name: Native - iOS (arm64, static)
+    runs-on: macos-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'ios' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: brew install meson ninja pkg-config
+
+      - name: Build webrtc + shim (static, device arm64) and merge
+        run: |
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          PREFIX="$GITHUB_WORKSPACE/wap-install-ios"
+          git clone --depth 1 --branch "$WAP_REF" "$WAP_URL" wap-src
+
+          cat > cross-ios.txt <<EOF
+          [binaries]
+          c = 'clang'
+          cpp = 'clang++'
+          ar = 'ar'
+          strip = 'strip'
+          [built-in options]
+          c_args = ['-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=$IOS_MIN']
+          cpp_args = ['-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=$IOS_MIN']
+          c_link_args = ['-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=$IOS_MIN']
+          cpp_link_args = ['-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=$IOS_MIN']
+          pkg_config_path = '$PREFIX/lib/pkgconfig'
+          [host_machine]
+          system = 'darwin'
+          subsystem = 'ios'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+
+          meson setup wap-build-ios wap-src --cross-file cross-ios.txt \
+            --prefix="$PREFIX" --buildtype=release -Ddefault_library=static
+          meson compile -C wap-build-ios
+          meson install -C wap-build-ios
+
+          # static_library: only compiles apm_c_api.o against the headers (no link); merge it with the
+          # webrtc + abseil + pffft archives into one self-contained libWebRtcApm.a for Unity/Xcode.
+          meson setup shim-ios Native --cross-file cross-ios.txt --buildtype=release -Dlibkind=static
+          meson compile -C shim-ios
+
+          mkdir -p ios-out
+          ARCHIVES="$(find wap-build-ios -name '*.a') $(find shim-ios -name 'libWebRtcApm.a')"
+          echo "=== Merging archives ==="
+          echo "$ARCHIVES" | tr ' ' '\n'
+          libtool -static -o ios-out/libWebRtcApm.a $ARCHIVES
+          lipo -info ios-out/libWebRtcApm.a || true
+          ls -lh ios-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webrtcapm-ios
+          path: ios-out/libWebRtcApm.a
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------------------------------------
   package:
     name: Bundle (Unity Plugins layout)
-    needs: [ build-linux, build-windows, build-macos ]
+    needs: [ build-linux, build-windows, build-macos, build-android, build-ios ]
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' }}
+    # Run even if some platforms fail, so a partial (e.g. desktop-only) bundle is still produced.
+    if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all') }}
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -201,12 +333,13 @@ jobs:
 
       - name: Arrange into Unity Plugins/WebRtcApm/ layout
         run: |
-          mkdir -p out/Plugins/WebRtcApm/x86_64
-          mkdir -p out/Plugins/WebRtcApm/linux
-          mkdir -p out/Plugins/WebRtcApm/macOS
-          cp artifacts/webrtcapm-windows-x64/WebRtcApm.dll      out/Plugins/WebRtcApm/x86_64/WebRtcApm.dll
-          cp artifacts/webrtcapm-linux-x64/libWebRtcApm.so      out/Plugins/WebRtcApm/linux/libWebRtcApm.so
-          cp artifacts/webrtcapm-macos-universal/libWebRtcApm.dylib out/Plugins/WebRtcApm/macOS/libWebRtcApm.dylib
+          base=out/Plugins/WebRtcApm
+          mkdir -p $base/x86_64 $base/linux $base/macOS $base/Android $base/iOS
+          cp artifacts/webrtcapm-windows-x64/WebRtcApm.dll        $base/x86_64/WebRtcApm.dll          || echo "windows missing"
+          cp artifacts/webrtcapm-linux-x64/libWebRtcApm.so        $base/linux/libWebRtcApm.so         || echo "linux missing"
+          cp artifacts/webrtcapm-macos-universal/libWebRtcApm.dylib $base/macOS/libWebRtcApm.dylib    || echo "macos missing"
+          cp -r artifacts/webrtcapm-android/*                     $base/Android/                      || echo "android missing"
+          cp artifacts/webrtcapm-ios/libWebRtcApm.a               $base/iOS/libWebRtcApm.a            || echo "ios missing"
           echo "=== Bundle ==="
           find out -type f | sort | xargs ls -lh
 

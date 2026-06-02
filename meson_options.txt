@@ -1,0 +1,2 @@
+# 'shared' for desktop + Android (one self-contained .dll/.so/.dylib); 'static' for iOS (.a, merged afterward).
+option('libkind', type: 'combo', choices: ['shared', 'static'], value: 'shared')
