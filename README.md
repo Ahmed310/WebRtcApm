@@ -31,20 +31,20 @@ Opus-CSharp one). Repo layout:
 ```
 <repo-root>/
   .github/workflows/webrtcapm-build.yml   <- copy of webrtcapm-build.yml
-  Native/apm_c_api.h                       <- copy these 4 from this Native~ folder
-  Native/apm_c_api.cpp
-  Native/meson.build                       <- CI builds the shim with meson (robust static linking)
-  Native/meson_options.txt
+  apm_c_api.h                              <- copy these 2 (root or ANY subfolder)
+  apm_c_api.cpp
 ```
 
-Push (or **Actions ▸ Build WebRtcApm ▸ Run workflow**). Each job builds `webrtc-audio-processing` from source
-(pinned `WAP_REF`, static) with meson, then builds the shim **also with meson** against it (meson resolves the
-static abseil/pffft/system deps natively — that is why CI uses meson, not the CMakeLists). Download the
-**`webrtcapm-all-platforms`** artifact — already arranged as `Plugins/WebRtcApm/{x86_64,linux,macOS,Android,iOS}/…`;
-drop it into the Unity project. Builds **Windows / Linux / macOS-universal / Android (arm64-v8a, armeabi-v7a,
-x86_64) / iOS (arm64)**.
+That's all — the two `apm_c_api.*` files can live anywhere in the repo; the workflow finds them and
+**generates the meson build files itself** (nothing else to copy).
 
-The `CMakeLists.txt` and the sections below are an alternative for building **locally** on desktop.
+Push (or **Actions ▸ Build WebRtcApm ▸ Run workflow**). Each job builds `webrtc-audio-processing` from source
+(pinned `WAP_REF`, static) with meson, then builds the shim **also with meson** (meson resolves the static
+abseil/pffft/system deps natively). Download the **`webrtcapm-all-platforms`** artifact — already arranged as
+`Plugins/WebRtcApm/{x86_64,linux,macOS,Android,iOS}/…`; drop it into the Unity project. Builds **Windows / Linux /
+macOS-universal / Android (arm64-v8a, armeabi-v7a, x86_64) / iOS (arm64)**.
+
+The `CMakeLists.txt` / `meson.build` here and the sections below are an alternative for building **locally** on desktop.
 
 ---
 
