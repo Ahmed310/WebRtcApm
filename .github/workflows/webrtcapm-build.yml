@@ -99,6 +99,8 @@ jobs:
       - name: Build WebRtcApm shim
         run: |
           export PKG_CONFIG_PATH="$GITHUB_WORKSPACE/wap-install/lib/pkgconfig:$GITHUB_WORKSPACE/wap-install/lib/x86_64-linux-gnu/pkgconfig:$GITHUB_WORKSPACE/wap-install/lib64/pkgconfig"
+          # webrtc public headers #include <absl/...>; its .pc omits the install include root, so add it.
+          export CPATH="$GITHUB_WORKSPACE/wap-install/include${CPATH:+:$CPATH}"
           meson setup shim-build shim-src --buildtype=release -Dlibkind=shared
           meson compile -C shim-build
 
@@ -182,6 +184,8 @@ jobs:
           CXX: cl
         run: |
           $env:PKG_CONFIG_PATH = "$env:GITHUB_WORKSPACE/wap-install/lib/pkgconfig"
+          # webrtc public headers #include <absl/...>; its .pc omits the install include root, so add it (MSVC reads INCLUDE).
+          $env:INCLUDE = "$env:GITHUB_WORKSPACE/wap-install/include;$env:INCLUDE"
           meson setup shim-build shim-src --buildtype=release -Dlibkind=shared
           meson compile -C shim-build
 
@@ -252,6 +256,7 @@ jobs:
       - name: Build WebRtcApm shim (universal)
         run: |
           export PKG_CONFIG_PATH="$GITHUB_WORKSPACE/wap-install/lib/pkgconfig"
+          export CPATH="$GITHUB_WORKSPACE/wap-install/include${CPATH:+:$CPATH}"
           meson setup shim-build shim-src --buildtype=release -Dlibkind=shared
           meson compile -C shim-build
 
@@ -337,6 +342,7 @@ jobs:
               --prefix="$PREFIX" --buildtype=release -Ddefault_library=static
             meson compile -C wap-build-$ABI
             meson install -C wap-build-$ABI
+            export CPATH="$PREFIX/include"
             meson setup shim-$ABI shim-src --cross-file cross-$ABI.txt \
               --buildtype=release -Dlibkind=shared
             meson compile -C shim-$ABI
@@ -424,6 +430,7 @@ jobs:
           meson compile -C wap-build-ios
           meson install -C wap-build-ios
 
+          export CPATH="$PREFIX/include"
           meson setup shim-ios shim-src --cross-file cross-ios.txt --buildtype=release -Dlibkind=static
           meson compile -C shim-ios
 
