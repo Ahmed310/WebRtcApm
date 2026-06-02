@@ -1,0 +1,217 @@
+# Build WebRtcApm — GitHub Actions workflow for the FnVoice WebRTC APM native plugin.
+#
+# Host this in a SEPARATE repo (like your Opus-CSharp one) with this layout:
+#
+#   <repo-root>/
+#     .github/workflows/webrtcapm-build.yml   <- this file
+#     Native/apm_c_api.h                       <- copied from FnVoice/Plugins/WebRtcApm/Native~/
+#     Native/apm_c_api.cpp
+#     Native/CMakeLists.txt
+#
+# Each job builds webrtc-audio-processing from source (pinned, STATIC) with meson, then CMake-builds the
+# apm_c_api shim against it and static-links -> ONE self-contained Unity plugin per platform. The final
+# `package` job arranges them into the Unity Plugins/WebRtcApm/ folder layout, ready to drop in.
+#
+# Outputs (names match [DllImport("WebRtcApm")] + Unity conventions):
+#   Windows x64      -> Plugins/WebRtcApm/x86_64/WebRtcApm.dll
+#   Linux   x64      -> Plugins/WebRtcApm/linux/libWebRtcApm.so
+#   macOS   universal-> Plugins/WebRtcApm/macOS/libWebRtcApm.dylib
+#
+# Android / iOS are deferred to FnVoice Phase 6.3 (meson cross-files + NDK/Xcode toolchains).
+
+name: Build WebRtcApm
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Platform to build'
+        required: true
+        default: 'all'
+        type: choice
+        options: [ all, linux, windows, macos ]
+      wap_ref:
+        description: 'webrtc-audio-processing git tag/branch'
+        required: false
+        default: 'v1.3'
+
+env:
+  # Pinned webrtc-audio-processing version (the PulseAudio fork). v1.x/v2.x expose the Config/ApplyConfig
+  # API the shim targets. Override per-run via the workflow_dispatch input.
+  WAP_REF: ${{ github.event.inputs.wap_ref || 'v1.3' }}
+  WAP_URL: https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing.git
+
+jobs:
+
+  build-linux:
+    name: Native - Linux (x64)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'linux' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential pkg-config python3-pip
+          pip3 install --upgrade meson ninja
+
+      - name: Build webrtc-audio-processing (static)
+        run: |
+          git clone --depth 1 --branch "$WAP_REF" "$WAP_URL" wap-src
+          meson setup wap-build wap-src \
+            --prefix="$GITHUB_WORKSPACE/wap-install" \
+            --buildtype=release -Ddefault_library=static
+          meson compile -C wap-build
+          meson install -C wap-build
+
+      - name: Build WebRtcApm shim
+        run: |
+          export PKG_CONFIG_PATH="$GITHUB_WORKSPACE/wap-install/lib/pkgconfig:$GITHUB_WORKSPACE/wap-install/lib/x86_64-linux-gnu/pkgconfig:$GITHUB_WORKSPACE/wap-install/lib64/pkgconfig"
+          cmake -S Native -B build -DCMAKE_BUILD_TYPE=Release -DWEBRTC_APM_STATIC=ON
+          cmake --build build --config Release
+
+      - name: Verify + stage
+        run: |
+          echo "=== Linux outputs ==="
+          find build -name 'libWebRtcApm.so' | sort
+          REAL=$(find build -name 'libWebRtcApm.so' ! -type l | head -n 1)
+          test -n "$REAL"
+          mkdir -p stage/linux
+          cp "$REAL" stage/linux/libWebRtcApm.so
+          ls -lh stage/linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webrtcapm-linux-x64
+          path: stage/linux/libWebRtcApm.so
+          if-no-files-found: error
+
+  build-windows:
+    name: Native - Windows (x64)
+    runs-on: windows-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'windows' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Activate MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install toolchain
+        shell: pwsh
+        run: |
+          pip install --upgrade meson ninja
+          choco install pkgconfiglite -y --no-progress
+
+      - name: Build webrtc-audio-processing (static)
+        shell: pwsh
+        run: |
+          git clone --depth 1 --branch "$env:WAP_REF" "$env:WAP_URL" wap-src
+          meson setup wap-build wap-src `
+            --prefix="$env:GITHUB_WORKSPACE/wap-install" `
+            --buildtype=release -Ddefault_library=static
+          meson compile -C wap-build
+          meson install -C wap-build
+
+      - name: Build WebRtcApm shim
+        shell: pwsh
+        run: |
+          $env:PKG_CONFIG_PATH = "$env:GITHUB_WORKSPACE/wap-install/lib/pkgconfig"
+          cmake -S Native -B build -G "Visual Studio 17 2022" -A x64 -DWEBRTC_APM_STATIC=ON
+          cmake --build build --config Release
+
+      - name: Verify + stage
+        shell: pwsh
+        run: |
+          Write-Host "=== Windows outputs ==="
+          Get-ChildItem -Recurse build -Filter WebRtcApm.dll | ForEach-Object { $_.FullName }
+          $dll = Get-ChildItem -Recurse build -Filter WebRtcApm.dll | Select-Object -First 1
+          if (-not $dll) { throw "WebRtcApm.dll not produced." }
+          New-Item -ItemType Directory -Force stage/win | Out-Null
+          Copy-Item $dll.FullName stage/win/WebRtcApm.dll
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webrtcapm-windows-x64
+          path: stage/win/WebRtcApm.dll
+          if-no-files-found: error
+
+  build-macos:
+    name: Native - macOS (universal)
+    runs-on: macos-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: brew install meson ninja pkg-config
+
+      - name: Build webrtc-audio-processing (static, universal)
+        env:
+          CFLAGS: "-arch arm64 -arch x86_64"
+          CXXFLAGS: "-arch arm64 -arch x86_64"
+          LDFLAGS: "-arch arm64 -arch x86_64"
+        run: |
+          git clone --depth 1 --branch "$WAP_REF" "$WAP_URL" wap-src
+          meson setup wap-build wap-src \
+            --prefix="$GITHUB_WORKSPACE/wap-install" \
+            --buildtype=release -Ddefault_library=static
+          meson compile -C wap-build
+          meson install -C wap-build
+
+      - name: Build WebRtcApm shim (universal)
+        run: |
+          export PKG_CONFIG_PATH="$GITHUB_WORKSPACE/wap-install/lib/pkgconfig"
+          cmake -S Native -B build -DCMAKE_BUILD_TYPE=Release \
+            -DWEBRTC_APM_STATIC=ON \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          cmake --build build --config Release
+
+      - name: Verify + stage
+        run: |
+          echo "=== macOS outputs ==="
+          REAL=$(find build -name 'libWebRtcApm.dylib' ! -type l | head -n 1)
+          test -n "$REAL"
+          mkdir -p stage/macos
+          cp "$REAL" stage/macos/libWebRtcApm.dylib
+          lipo -info stage/macos/libWebRtcApm.dylib || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webrtcapm-macos-universal
+          path: stage/macos/libWebRtcApm.dylib
+          if-no-files-found: error
+
+  package:
+    name: Bundle (Unity Plugins layout)
+    needs: [ build-linux, build-windows, build-macos ]
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Arrange into Unity Plugins/WebRtcApm/ layout
+        run: |
+          mkdir -p out/Plugins/WebRtcApm/x86_64
+          mkdir -p out/Plugins/WebRtcApm/linux
+          mkdir -p out/Plugins/WebRtcApm/macOS
+          cp artifacts/webrtcapm-windows-x64/WebRtcApm.dll      out/Plugins/WebRtcApm/x86_64/WebRtcApm.dll
+          cp artifacts/webrtcapm-linux-x64/libWebRtcApm.so      out/Plugins/WebRtcApm/linux/libWebRtcApm.so
+          cp artifacts/webrtcapm-macos-universal/libWebRtcApm.dylib out/Plugins/WebRtcApm/macOS/libWebRtcApm.dylib
+          echo "=== Bundle ==="
+          find out -type f | sort | xargs ls -lh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webrtcapm-all-platforms
+          path: out/
+          if-no-files-found: error
