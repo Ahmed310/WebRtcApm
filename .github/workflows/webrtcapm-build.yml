@@ -32,7 +32,7 @@ on:
         required: true
         default: 'all'
         type: choice
-        options: [ all, linux, windows, macos, android, ios ]
+        options: [ all, linux, windows, macos, android, ios, visionos ]
       wap_ref:
         description: 'webrtc-audio-processing git tag/branch'
         required: false
@@ -208,10 +208,6 @@ jobs:
     name: Native - macOS (universal)
     runs-on: macos-latest
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'macos' }}
-    env:
-      CFLAGS: "-arch arm64 -arch x86_64"
-      CXXFLAGS: "-arch arm64 -arch x86_64"
-      LDFLAGS: "-arch arm64 -arch x86_64"
     steps:
       - uses: actions/checkout@v4
 
@@ -245,26 +241,57 @@ jobs:
           MBUILD
           ls -la shim-src
 
-      - name: Build webrtc-audio-processing (static, universal)
+      # One-pass universal (-arch arm64 -arch x86_64) can't build webrtc's per-arch SIMD: meson's feature
+      # checks run once on the arm64 host, so the x86_64 SSE2/AVX2 sources are never compiled yet the x86_64
+      # slice still references them (FIRFilterAVX2/Convolve_SSE/...). Build each arch separately so each runs
+      # its own SIMD detection, then lipo the two single-arch dylibs into one universal.
+      - name: Build per-arch (arm64 + x86_64) and lipo
         run: |
           git clone --depth 1 --branch "$WAP_REF" "$WAP_URL" wap-src
-          meson setup wap-build wap-src --prefix="$GITHUB_WORKSPACE/wap-install" \
-            --buildtype=release -Ddefault_library=static
-          meson compile -C wap-build
-          meson install -C wap-build
 
-      - name: Build WebRtcApm shim (universal)
-        run: |
-          export PKG_CONFIG_PATH="$GITHUB_WORKSPACE/wap-install/lib/pkgconfig"
-          export CPATH="$GITHUB_WORKSPACE/wap-install/include${CPATH:+:$CPATH}"
-          meson setup shim-build shim-src --buildtype=release -Dlibkind=shared
-          meson compile -C shim-build
+          build_arch () {
+            ARCH="$1"; CROSS="$2"
+            PREFIX="$GITHUB_WORKSPACE/wap-install-$ARCH"
+            EXTRA=""
+            [ -n "$CROSS" ] && EXTRA="--cross-file $CROSS"
+            meson setup wap-$ARCH wap-src $EXTRA --prefix="$PREFIX" --buildtype=release -Ddefault_library=static
+            meson compile -C wap-$ARCH
+            meson install -C wap-$ARCH
+            export CPATH="$PREFIX/include"
+            export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+            meson setup shim-$ARCH shim-src $EXTRA --buildtype=release -Dlibkind=shared
+            meson compile -C shim-$ARCH
+          }
 
-      - name: Verify + stage
-        run: |
+          # arm64 = native on the macos-latest runner.
+          build_arch arm64 ""
+
+          # x86_64 = single-arch cross file, so its own SSE2/AVX2 feature detection is correct.
+          cat > cross-x86_64.txt <<EOF
+          [binaries]
+          c = 'clang'
+          cpp = 'clang++'
+          ar = 'ar'
+          strip = 'strip'
+          pkg-config = 'pkg-config'
+          [built-in options]
+          c_args = ['-arch', 'x86_64']
+          cpp_args = ['-arch', 'x86_64']
+          c_link_args = ['-arch', 'x86_64']
+          cpp_link_args = ['-arch', 'x86_64']
+          pkg_config_path = '$GITHUB_WORKSPACE/wap-install-x86_64/lib/pkgconfig'
+          [host_machine]
+          system = 'darwin'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+          EOF
+          build_arch x86_64 cross-x86_64.txt
+
           mkdir -p stage/macos
-          cp shim-build/libWebRtcApm.dylib stage/macos/libWebRtcApm.dylib
-          lipo -info stage/macos/libWebRtcApm.dylib || true
+          lipo -create shim-arm64/libWebRtcApm.dylib shim-x86_64/libWebRtcApm.dylib \
+            -output stage/macos/libWebRtcApm.dylib
+          lipo -info stage/macos/libWebRtcApm.dylib
 
       - uses: actions/upload-artifact@v4
         with:
@@ -330,6 +357,7 @@ jobs:
           cpp = '$NDK_BIN/${CLANG}++'
           ar = '$NDK_BIN/llvm-ar'
           strip = '$NDK_BIN/llvm-strip'
+          pkg-config = 'pkg-config'
           [built-in options]
           pkg_config_path = '$PREFIX/lib/pkgconfig'
           [host_machine]
@@ -411,6 +439,7 @@ jobs:
           cpp = 'clang++'
           ar = 'ar'
           strip = 'strip'
+          pkg-config = 'pkg-config'
           [built-in options]
           c_args = ['-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=$IOS_MIN']
           cpp_args = ['-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=$IOS_MIN']
@@ -448,9 +477,93 @@ jobs:
           if-no-files-found: error
 
   # ----------------------------------------------------------------------------------------------
+  build-visionos:
+    name: Native - visionOS (arm64, static)
+    runs-on: macos-latest
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == 'visionos' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: brew install meson ninja pkg-config
+
+      - name: Stage shim source (+ generate meson files)
+        shell: bash
+        run: |
+          H=$(find . -path ./.git -prune -o -name 'apm_c_api.h'   -print | head -1)
+          C=$(find . -path ./.git -prune -o -name 'apm_c_api.cpp' -print | head -1)
+          [ -n "$H" ] && [ -n "$C" ] || { echo "ERROR: apm_c_api.h/.cpp not found in repo"; exit 1; }
+          mkdir -p shim-src
+          cp "$H" "$C" shim-src/
+          cat > shim-src/meson_options.txt <<'MOPTS'
+          option('libkind', type: 'combo', choices: ['shared', 'static'], value: 'shared')
+          MOPTS
+          cat > shim-src/meson.build <<'MBUILD'
+          project('webrtcapm', 'cpp', version: '1.0.0',
+            default_options: ['cpp_std=c++17', 'buildtype=release', 'b_staticpic=true'])
+          apm = dependency('webrtc-audio-processing-2', required: false, static: true)
+          if not apm.found()
+            apm = dependency('webrtc-audio-processing-1', required: true, static: true)
+          endif
+          if get_option('libkind') == 'static'
+            static_library('WebRtcApm', 'apm_c_api.cpp', dependencies: apm, install: false)
+          else
+            shared_library('WebRtcApm', 'apm_c_api.cpp', dependencies: apm, install: false)
+          endif
+          MBUILD
+
+      - name: Build webrtc + shim (static, visionOS device arm64) and merge
+        run: |
+          SDK="$(xcrun --sdk xros --show-sdk-path)"
+          PREFIX="$GITHUB_WORKSPACE/wap-install-xros"
+          git clone --depth 1 --branch "$WAP_REF" "$WAP_URL" wap-src
+
+          cat > cross-xros.txt <<EOF
+          [binaries]
+          c = 'clang'
+          cpp = 'clang++'
+          ar = 'ar'
+          strip = 'strip'
+          pkg-config = 'pkg-config'
+          [built-in options]
+          c_args = ['-target', 'arm64-apple-xros1.0', '-isysroot', '$SDK']
+          cpp_args = ['-target', 'arm64-apple-xros1.0', '-isysroot', '$SDK']
+          c_link_args = ['-target', 'arm64-apple-xros1.0', '-isysroot', '$SDK']
+          cpp_link_args = ['-target', 'arm64-apple-xros1.0', '-isysroot', '$SDK']
+          pkg_config_path = '$PREFIX/lib/pkgconfig'
+          [host_machine]
+          system = 'darwin'
+          cpu_family = 'aarch64'
+          cpu = 'aarch64'
+          endian = 'little'
+          EOF
+
+          meson setup wap-build-xros wap-src --cross-file cross-xros.txt \
+            --prefix="$PREFIX" --buildtype=release -Ddefault_library=static
+          meson compile -C wap-build-xros
+          meson install -C wap-build-xros
+
+          export CPATH="$PREFIX/include"
+          meson setup shim-xros shim-src --cross-file cross-xros.txt --buildtype=release -Dlibkind=static
+          meson compile -C shim-xros
+
+          mkdir -p visionos-out
+          ARCHIVES="$(find wap-build-xros -name '*.a') $(find shim-xros -name 'libWebRtcApm.a')"
+          echo "=== Merging archives ==="; echo "$ARCHIVES" | tr ' ' '\n'
+          libtool -static -o visionos-out/libWebRtcApm.a $ARCHIVES
+          lipo -info visionos-out/libWebRtcApm.a || true
+          ls -lh visionos-out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: webrtcapm-visionos
+          path: visionos-out/libWebRtcApm.a
+          if-no-files-found: error
+
+  # ----------------------------------------------------------------------------------------------
   package:
     name: Bundle (Unity Plugins layout)
-    needs: [ build-linux, build-windows, build-macos, build-android, build-ios ]
+    needs: [ build-linux, build-windows, build-macos, build-android, build-ios, build-visionos ]
     runs-on: ubuntu-latest
     if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.platform == 'all') }}
     steps:
@@ -462,12 +575,13 @@ jobs:
       - name: Arrange into Unity Plugins/WebRtcApm/ layout
         run: |
           base=out/Plugins/WebRtcApm
-          mkdir -p $base/x86_64 $base/linux $base/macOS $base/Android $base/iOS
+          mkdir -p $base/x86_64 $base/linux $base/macOS $base/Android $base/iOS $base/visionOS
           cp artifacts/webrtcapm-windows-x64/WebRtcApm.dll          $base/x86_64/WebRtcApm.dll       || echo "windows missing"
           cp artifacts/webrtcapm-linux-x64/libWebRtcApm.so          $base/linux/libWebRtcApm.so      || echo "linux missing"
           cp artifacts/webrtcapm-macos-universal/libWebRtcApm.dylib $base/macOS/libWebRtcApm.dylib   || echo "macos missing"
           cp -r artifacts/webrtcapm-android/*                       $base/Android/                   || echo "android missing"
           cp artifacts/webrtcapm-ios/libWebRtcApm.a                 $base/iOS/libWebRtcApm.a         || echo "ios missing"
+          cp artifacts/webrtcapm-visionos/libWebRtcApm.a            $base/visionOS/libWebRtcApm.a    || echo "visionos missing"
           echo "=== Bundle ==="
           find out -type f | sort | xargs ls -lh
 
