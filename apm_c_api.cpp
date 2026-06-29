@@ -29,30 +29,10 @@ struct ApmInstance {
 
 inline ApmInstance* as_instance(fn_apm_handle h) { return static_cast<ApmInstance*>(h); }
 
-} // namespace
-
-extern "C" {
-
-FN_APM_EXPORT fn_apm_handle fn_apm_create(void) {
-    ApmInstance* inst = new (std::nothrow) ApmInstance();
-    if (inst == nullptr) return nullptr;
-    inst->apm = AudioProcessingBuilder().Create();
-    if (inst->apm == nullptr) {
-        delete inst;
-        return nullptr;
-    }
-    return inst;
-}
-
-FN_APM_EXPORT void fn_apm_destroy(fn_apm_handle handle) {
-    if (handle == nullptr) return;
-    delete as_instance(handle);
-}
-
-FN_APM_EXPORT int fn_apm_configure(fn_apm_handle handle, int sample_rate_hz, int num_channels,
-                                   int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode) {
-    if (handle == nullptr) return -1;
-    ApmInstance* inst = as_instance(handle);
+// Shared config path for fn_apm_configure (AGC1 only, passes enable_agc2=0) and fn_apm_configure2 (adds AGC2).
+int apply_config(ApmInstance* inst, int sample_rate_hz, int num_channels,
+                 int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode,
+                 int enable_agc2, int agc2_adaptive_digital) {
     inst->sample_rate = sample_rate_hz;
     inst->channels = num_channels;
 
@@ -76,10 +56,50 @@ FN_APM_EXPORT int fn_apm_configure(fn_apm_handle handle, int sample_rate_hz, int
         ? AudioProcessing::Config::GainController1::kFixedDigital
         : AudioProcessing::Config::GainController1::kAdaptiveDigital;
 
+    // AGC2 (modern adaptive-digital gain) — opt-in via fn_apm_configure2; fn_apm_configure passes 0 here.
+    config.gain_controller2.enabled = enable_agc2 != 0;
+    config.gain_controller2.adaptive_digital.enabled = (enable_agc2 != 0) && (agc2_adaptive_digital != 0);
+
     config.high_pass_filter.enabled = true;
 
     inst->apm->ApplyConfig(config);
     return 0;
+}
+
+} // namespace
+
+extern "C" {
+
+FN_APM_EXPORT fn_apm_handle fn_apm_create(void) {
+    ApmInstance* inst = new (std::nothrow) ApmInstance();
+    if (inst == nullptr) return nullptr;
+    inst->apm = AudioProcessingBuilder().Create();
+    if (inst->apm == nullptr) {
+        delete inst;
+        return nullptr;
+    }
+    return inst;
+}
+
+FN_APM_EXPORT void fn_apm_destroy(fn_apm_handle handle) {
+    if (handle == nullptr) return;
+    delete as_instance(handle);
+}
+
+FN_APM_EXPORT int fn_apm_configure(fn_apm_handle handle, int sample_rate_hz, int num_channels,
+                                   int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode) {
+    if (handle == nullptr) return -1;
+    return apply_config(as_instance(handle), sample_rate_hz, num_channels,
+                        enable_aec, enable_ns, enable_agc, ns_level, agc_mode, 0, 0);
+}
+
+FN_APM_EXPORT int fn_apm_configure2(fn_apm_handle handle, int sample_rate_hz, int num_channels,
+                                    int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode,
+                                    int enable_agc2, int agc2_adaptive_digital) {
+    if (handle == nullptr) return -1;
+    return apply_config(as_instance(handle), sample_rate_hz, num_channels,
+                        enable_aec, enable_ns, enable_agc, ns_level, agc_mode,
+                        enable_agc2, agc2_adaptive_digital);
 }
 
 FN_APM_EXPORT int fn_apm_process_stream(fn_apm_handle handle, float* frame, int num_samples) {

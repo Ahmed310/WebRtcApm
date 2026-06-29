@@ -45,6 +45,17 @@ FN_APM_EXPORT void fn_apm_destroy(fn_apm_handle handle);
 FN_APM_EXPORT int fn_apm_configure(fn_apm_handle handle, int sample_rate_hz, int num_channels,
                                    int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode);
 
+/*
+ * Configure with AGC2 control — a backward-compatible SUPERSET of fn_apm_configure (a SEPARATE export, NOT a
+ * re-signature, so old managed bindings keep working and new bindings can probe for this symbol).
+ *   enable_agc2           : enable gain_controller2 (modern AGC) (0/1) — typically replaces AGC1
+ *   agc2_adaptive_digital : gain_controller2 adaptive-digital sub-stage (0/1)
+ * Returns 0 on success.
+ */
+FN_APM_EXPORT int fn_apm_configure2(fn_apm_handle handle, int sample_rate_hz, int num_channels,
+                                    int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode,
+                                    int enable_agc2, int agc2_adaptive_digital);
+
 /* Process one 10 ms mono capture frame in place. num_samples == sample_rate_hz / 100. Returns 0 on success. */
 FN_APM_EXPORT int fn_apm_process_stream(fn_apm_handle handle, float* frame, int num_samples);
 
