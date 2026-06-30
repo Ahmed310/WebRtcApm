@@ -14,10 +14,27 @@
 #include <modules/audio_processing/include/audio_processing.h>
 
 #include <new>
+#include <cstdint>
+#include <cstddef>
 
 using webrtc::AudioProcessing;
 using webrtc::AudioProcessingBuilder;
 using webrtc::StreamConfig;
+
+// ---- WebRTC GMM VAD (webrtc/common_audio/vad) ---------------------------------------------------
+// The standalone statistical VAD is compiled into webrtc-audio-processing's static lib, but its public
+// header (common_audio/vad/include/webrtc_vad.h) is not installed. Forward-declare the C entry points
+// here so the linker resolves them from the already-linked archive — no extra dependency, no build-
+// script changes. If a future webrtc-audio-processing stops compiling these, the link fails at THIS
+// symbol set on the affected platform; the documented fallback is to vendor libfvad (see README).
+extern "C" {
+    typedef struct WebRtcVadInst VadInst;
+    VadInst* WebRtcVad_Create(void);
+    int      WebRtcVad_Init(VadInst* self);
+    int      WebRtcVad_set_mode(VadInst* self, int mode);
+    int      WebRtcVad_Process(VadInst* self, int fs, const int16_t* audio_frame, size_t frame_length);
+    void     WebRtcVad_Free(VadInst* self);
+}
 
 namespace {
 
@@ -25,6 +42,12 @@ struct ApmInstance {
     rtc::scoped_refptr<AudioProcessing> apm;
     int sample_rate = 16000;
     int channels = 1;
+};
+
+// Wraps a WebRtcVad handle plus the sample rate it was created for (WebRtcVad_Process needs fs each call).
+struct VadInstance {
+    VadInst* vad = nullptr;
+    int fs = 16000;
 };
 
 inline ApmInstance* as_instance(fn_apm_handle h) { return static_cast<ApmInstance*>(h); }
@@ -147,6 +170,51 @@ FN_APM_EXPORT int fn_apm_set_stream_delay_ms(fn_apm_handle handle, int delay_ms)
     if (handle == nullptr) return -1;
     as_instance(handle)->apm->set_stream_delay_ms(delay_ms);
     return 0;
+}
+
+// ---- VAD surface --------------------------------------------------------------------------------
+
+FN_APM_EXPORT fn_vad_handle fn_vad_create(int sample_rate_hz, int mode) {
+    VadInst* vad = WebRtcVad_Create();
+    if (vad == nullptr) return nullptr;
+    if (WebRtcVad_Init(vad) != 0) {
+        WebRtcVad_Free(vad);
+        return nullptr;
+    }
+    if (mode < 0) mode = 0;
+    if (mode > 3) mode = 3;
+    WebRtcVad_set_mode(vad, mode);
+
+    VadInstance* inst = new (std::nothrow) VadInstance();
+    if (inst == nullptr) {
+        WebRtcVad_Free(vad);
+        return nullptr;
+    }
+    inst->vad = vad;
+    inst->fs = sample_rate_hz;
+    return inst;
+}
+
+FN_APM_EXPORT void fn_vad_destroy(fn_vad_handle handle) {
+    if (handle == nullptr) return;
+    VadInstance* inst = static_cast<VadInstance*>(handle);
+    WebRtcVad_Free(inst->vad);
+    delete inst;
+}
+
+FN_APM_EXPORT int fn_vad_set_mode(fn_vad_handle handle, int mode) {
+    if (handle == nullptr) return -1;
+    if (mode < 0) mode = 0;
+    if (mode > 3) mode = 3;
+    return WebRtcVad_set_mode(static_cast<VadInstance*>(handle)->vad, mode);
+}
+
+FN_APM_EXPORT int fn_vad_process(fn_vad_handle handle, const short* frame, int num_samples) {
+    if (handle == nullptr || frame == nullptr) return -1;
+    VadInstance* inst = static_cast<VadInstance*>(handle);
+    return WebRtcVad_Process(inst->vad, inst->fs,
+                             reinterpret_cast<const int16_t*>(frame),
+                             static_cast<size_t>(num_samples));
 }
 
 } // extern "C"

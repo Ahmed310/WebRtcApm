@@ -78,6 +78,31 @@ FN_APM_EXPORT int fn_apm_process_reverse_stream(fn_apm_handle handle, float* fra
 /* Set the mic-vs-render delay hint (ms) used by AEC. Returns 0 on success. */
 FN_APM_EXPORT int fn_apm_set_stream_delay_ms(fn_apm_handle handle, int delay_ms);
 
+/* ---- WebRTC statistical (GMM) voice-activity detector -------------------------------------------
+ * A real VAD (the same engine libfvad wraps), bound by the Unity side's WebRtcFvadDetector. The
+ * underlying WebRtcVad_* sources ship inside webrtc-audio-processing's common_audio but its public
+ * header is not installed, so the shim forward-declares them and re-exports this flat surface.
+ *
+ * The VAD uses a SEPARATE handle/lifetime from the APM (it works on int16, the APM on float). These
+ * are SEPARATE exports (like fn_apm_configure2/3) so an older WebRtcApm without them still loads for
+ * the APM path and the managed binding degrades to amplitude detection (EntryPointNotFoundException).
+ */
+typedef void* fn_vad_handle;
+
+/* Create a GMM VAD. mode 0..3 (3 = most aggressive about rejecting non-speech).
+ * sample_rate_hz must be one of {8000, 16000, 32000, 48000}. Returns NULL on failure. */
+FN_APM_EXPORT fn_vad_handle fn_vad_create(int sample_rate_hz, int mode);
+
+/* Destroy a VAD created by fn_vad_create. Safe to call with NULL. */
+FN_APM_EXPORT void fn_vad_destroy(fn_vad_handle handle);
+
+/* Change the aggressiveness mode (0..3) on a live VAD. Returns 0 on success. */
+FN_APM_EXPORT int fn_vad_set_mode(fn_vad_handle handle, int mode);
+
+/* Classify one 10 ms int16 mono frame (num_samples == sample_rate_hz / 100).
+ * Returns 1 = voice, 0 = silence, <0 = error. */
+FN_APM_EXPORT int fn_vad_process(fn_vad_handle handle, const short* frame, int num_samples);
+
 #ifdef __cplusplus
 }
 #endif
