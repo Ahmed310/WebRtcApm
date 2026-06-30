@@ -56,6 +56,19 @@ FN_APM_EXPORT int fn_apm_configure2(fn_apm_handle handle, int sample_rate_hz, in
                                     int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode,
                                     int enable_agc2, int agc2_adaptive_digital);
 
+/*
+ * Configure with AGC2 + explicit AGC2 loudness tuning (backward-compatible superset of fn_apm_configure2; a
+ * SEPARATE export so old bindings keep working and new bindings can probe for it). v1.x AGC2 knobs:
+ *   agc2_fixed_gain_db        : flat pre-gain ahead of the limiter, dB (0..~24 sensible; 0..90 valid). Louder.
+ *   agc2_noise_ceiling_dbfs   : adaptive_digital.max_output_noise_level_dbfs — the noise ceiling. Raise toward
+ *                               0 (e.g. -40) to let AGC2 amplify MORE in noise; more negative = quieter/safer.
+ * Returns 0 on success.
+ */
+FN_APM_EXPORT int fn_apm_configure3(fn_apm_handle handle, int sample_rate_hz, int num_channels,
+                                    int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode,
+                                    int enable_agc2, int agc2_adaptive_digital,
+                                    float agc2_fixed_gain_db, float agc2_noise_ceiling_dbfs);
+
 /* Process one 10 ms mono capture frame in place. num_samples == sample_rate_hz / 100. Returns 0 on success. */
 FN_APM_EXPORT int fn_apm_process_stream(fn_apm_handle handle, float* frame, int num_samples);
 

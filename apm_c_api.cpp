@@ -32,7 +32,7 @@ inline ApmInstance* as_instance(fn_apm_handle h) { return static_cast<ApmInstanc
 // Shared config path for fn_apm_configure (AGC1 only, passes enable_agc2=0) and fn_apm_configure2 (adds AGC2).
 int apply_config(ApmInstance* inst, int sample_rate_hz, int num_channels,
                  int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode,
-                 int enable_agc2, int agc2_adaptive_digital) {
+                 int enable_agc2, int agc2_adaptive_digital, float agc2_fixed_gain_db, float agc2_noise_ceiling_dbfs) {
     inst->sample_rate = sample_rate_hz;
     inst->channels = num_channels;
 
@@ -56,9 +56,23 @@ int apply_config(ApmInstance* inst, int sample_rate_hz, int num_channels,
         ? AudioProcessing::Config::GainController1::kFixedDigital
         : AudioProcessing::Config::GainController1::kAdaptiveDigital;
 
-    // AGC2 (modern adaptive-digital gain) — opt-in via fn_apm_configure2; fn_apm_configure passes 0 here.
+    // AGC2 (modern adaptive-digital gain). NOTE: webrtc-audio-processing v1.x exposes DIFFERENT knobs than v2
+    // (no max_gain_db/headroom_db — those are v2-only and would not compile). The v1.x loudness levers are:
+    //   fixed_digital.gain_db                : flat pre-gain ahead of the limiter (unconditional boost)
+    //   adaptive_digital.max_output_noise_level_dbfs : the NOISE CEILING that throttles gain in noise; raising it
+    //                                          toward 0 makes AGC2 amplify more near a fan (louder, but a louder
+    //                                          noise floor too — rely on NS upstream). Default -50 was too quiet.
+    // The saturation margins + gain-change rate are tuned for a hotter, faster-recovering level.
     config.gain_controller2.enabled = enable_agc2 != 0;
-    config.gain_controller2.adaptive_digital.enabled = (enable_agc2 != 0) && (agc2_adaptive_digital != 0);
+    if (enable_agc2 != 0) {
+        config.gain_controller2.fixed_digital.gain_db = agc2_fixed_gain_db;
+        auto& ad = config.gain_controller2.adaptive_digital;
+        ad.enabled = agc2_adaptive_digital != 0;
+        ad.max_output_noise_level_dbfs   = agc2_noise_ceiling_dbfs;
+        ad.initial_saturation_margin_db  = 12.0f;   // was 20: less reserved headroom -> targets louder
+        ad.extra_saturation_margin_db    = 1.0f;    // was 2
+        ad.max_gain_change_db_per_second = 6.0f;    // was 3: recover loudness faster after noise transients
+    }
 
     config.high_pass_filter.enabled = true;
 
@@ -90,16 +104,27 @@ FN_APM_EXPORT int fn_apm_configure(fn_apm_handle handle, int sample_rate_hz, int
                                    int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode) {
     if (handle == nullptr) return -1;
     return apply_config(as_instance(handle), sample_rate_hz, num_channels,
-                        enable_aec, enable_ns, enable_agc, ns_level, agc_mode, 0, 0);
+                        enable_aec, enable_ns, enable_agc, ns_level, agc_mode, 0, 0, 0.0f, -50.0f);
 }
 
 FN_APM_EXPORT int fn_apm_configure2(fn_apm_handle handle, int sample_rate_hz, int num_channels,
                                     int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode,
                                     int enable_agc2, int agc2_adaptive_digital) {
     if (handle == nullptr) return -1;
+    // Tuned AGC2 defaults (louder in noise) for callers that don't pass explicit gain params.
     return apply_config(as_instance(handle), sample_rate_hz, num_channels,
                         enable_aec, enable_ns, enable_agc, ns_level, agc_mode,
-                        enable_agc2, agc2_adaptive_digital);
+                        enable_agc2, agc2_adaptive_digital, 6.0f, -40.0f);
+}
+
+FN_APM_EXPORT int fn_apm_configure3(fn_apm_handle handle, int sample_rate_hz, int num_channels,
+                                    int enable_aec, int enable_ns, int enable_agc, int ns_level, int agc_mode,
+                                    int enable_agc2, int agc2_adaptive_digital,
+                                    float agc2_fixed_gain_db, float agc2_noise_ceiling_dbfs) {
+    if (handle == nullptr) return -1;
+    return apply_config(as_instance(handle), sample_rate_hz, num_channels,
+                        enable_aec, enable_ns, enable_agc, ns_level, agc_mode,
+                        enable_agc2, agc2_adaptive_digital, agc2_fixed_gain_db, agc2_noise_ceiling_dbfs);
 }
 
 FN_APM_EXPORT int fn_apm_process_stream(fn_apm_handle handle, float* frame, int num_samples) {
